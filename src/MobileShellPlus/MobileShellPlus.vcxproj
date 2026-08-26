@@ -172,7 +172,7 @@
       </IgnoreSpecificDefaultLibraries>
     </Link>
     <PostBuildEvent>
-      <Command Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">copy /Y "$(TargetDir)$(ProjectName).exe" "Z:\$(ProjectName).exe"</Command>
+      <Command></Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
