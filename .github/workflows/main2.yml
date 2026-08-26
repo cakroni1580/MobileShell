@@ -1,0 +1,518 @@
+# BEFORE
+# Restore NuGet packages
+# ...
+# Find old toolsets
+# ...
+# Retarget legacy VC projects
+# ...
+# Build Solution
+
+# AFTER
+name: Build Windows 11 Mobile Shell
+
+on:
+  push:
+    branches: [ main, xamlhost, codegen-bot/windows11-mobile-ui ]
+  pull_request:
+    branches: [ main, xamlhost ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    permissions:
+      contents: write
+
+    env:
+      WINDOWS_SDK_VERSION: "10.0.26100.0"
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # ================================================================
+    # INSTALL VS COMPONENTS
+    #
+    # MobSDes is legacy UWP/XAML C#.
+    # Therefore Windows SDK alone is NOT enough:
+    # UWP.Support is required for UAP.props / UAP.targets and
+    # the UWP project infrastructure.
+    # ================================================================
+    - name: Install Windows 11 SDK + UWP tools
+      shell: powershell
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+
+        $vsPath = & $vswhere `
+          -version "[17.0,18.0)" `
+          -products * `
+          -latest `
+          -property installationPath
+
+        if (-not $vsPath) {
+          throw "Visual Studio 2022 installation not found."
+        }
+
+        Write-Host "Visual Studio: $vsPath"
+
+        $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+
+        & $vsInstaller modify `
+          --installPath "$vsPath" `
+          --add Microsoft.VisualStudio.ComponentGroup.UWP.Support `
+          --add Microsoft.VisualStudio.ComponentGroup.UWP.NetCoreAndStandard `
+          --add Microsoft.VisualStudio.ComponentGroup.MSIX.Packaging `
+          --add Microsoft.VisualStudio.Component.VC.Tools.ARM64 `
+          --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+          --add Microsoft.VisualStudio.Component.VC.v143 `
+          --add Microsoft.VisualStudio.Component.Windows11SDK.26100 `
+          --quiet `
+          --wait `
+          --norestart
+
+        if ($LASTEXITCODE -ne 0) {
+          throw "Visual Studio Installer failed with exit code $LASTEXITCODE"
+        }
+
+    # ================================================================
+    # SETUP MSBUILD
+    # ================================================================
+    - name: Setup MSBuild VS2022
+      uses: microsoft/setup-msbuild@v2
+
+    # ================================================================
+    # VERIFY WINDOWS SDK + UWP INFRASTRUCTURE
+    # ================================================================
+    - name: Verify Windows SDK and UWP
+      shell: powershell
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        $sdkRoot = "C:\Program Files (x86)\Windows Kits\10"
+        $sdkPath = Join-Path $sdkRoot "Platforms\UAP\$env:WINDOWS_SDK_VERSION"
+
+        Write-Host "Checking UAP SDK:"
+        Write-Host $sdkPath
+
+        if (-not (Test-Path $sdkPath)) {
+          Write-Host ""
+          Write-Host "Available UAP SDK versions:"
+          Get-ChildItem "$sdkRoot\Platforms\UAP" -Directory |
+            Select-Object -ExpandProperty Name
+
+          throw "UAP SDK $env:WINDOWS_SDK_VERSION was not installed."
+        }
+
+        $uapProps = Join-Path $sdkPath "Platform.props"
+
+        if (-not (Test-Path $uapProps)) {
+          throw "UAP Platform.props missing: $uapProps"
+        }
+
+        Write-Host "UAP SDK OK:"
+        Get-ChildItem $sdkPath
+
+        Write-Host ""
+        Write-Host "Installed Windows SDKs:"
+        Get-ChildItem "$sdkRoot\Platforms\UAP" -Directory |
+          Select-Object -ExpandProperty Name
+
+        Write-Host ""
+        msbuild -version
+
+    # ================================================================
+    # RETARGET LEGACY WINDOWS SDK REFERENCES
+    #
+    # IMPORTANT:
+    # Only TargetPlatformVersion / WindowsTargetPlatformVersion /
+    # SDK-style SDK references are changed.
+    #
+    # TargetPlatformMinVersion is deliberately NOT changed.
+    # ================================================================
+    - name: Retarget Windows SDK to 26100
+      shell: powershell
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        $files = Get-ChildItem -Recurse `
+          -Include *.csproj,*.wapproj,*.props,*.targets,*.vcxproj
+
+        foreach ($file in $files) {
+          $path = $file.FullName
+          $content = Get-Content $path -Raw
+
+          $updated = $content
+
+          # Legacy SDK versions used by this solution.
+          $updated = $updated `
+            -replace '<TargetPlatformVersion>10\.0\.18362\.0</TargetPlatformVersion>',
+                     '<TargetPlatformVersion>10.0.26100.0</TargetPlatformVersion>' `
+            -replace '<WindowsTargetPlatformVersion>10\.0\.18362\.0</WindowsTargetPlatformVersion>',
+                     '<WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>' `
+            -replace 'WindowsTargetPlatformVersion=10\.0\.18362\.0',
+                     'WindowsTargetPlatformVersion=10.0.26100.0'
+
+          # Also handle explicit SDK attribute forms.
+          $updated = $updated `
+            -replace 'Version="10\.0\.18362\.0"',
+                     'Version="10.0.26100.0"'
+
+          if ($updated -ne $content) {
+            Write-Host "Retargeting SDK: $path"
+            Set-Content -Path $path -Value $updated -Encoding UTF8
+          }
+        }
+
+        Write-Host ""
+        Write-Host "Remaining 18362 references:"
+        $remaining = Get-ChildItem -Recurse `
+          -Include *.csproj,*.wapproj,*.props,*.targets,*.vcxproj |
+          Select-String "10\.0\.18362\.0"
+
+        if ($remaining) {
+          $remaining | ForEach-Object {
+            Write-Host "$($_.Path):$($_.LineNumber): $($_.Line.Trim())"
+          }
+        } else {
+          Write-Host "No project SDK references to 10.0.18362.0 remain."
+        }
+
+    # ================================================================
+    # RETARGET OLD VC TOOLSETS
+    # ================================================================
+    - name: Retarget legacy VC projects to v143
+      shell: powershell
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        Get-ChildItem -Recurse -Filter *.vcxproj | ForEach-Object {
+          $path = $_.FullName
+          $content = Get-Content $path -Raw
+
+          $updated = $content `
+            -replace '<PlatformToolset>v140</PlatformToolset>',
+                     '<PlatformToolset>v143</PlatformToolset>' `
+            -replace '<PlatformToolset>v141</PlatformToolset>',
+                     '<PlatformToolset>v143</PlatformToolset>' `
+            -replace '<PlatformToolset>v142</PlatformToolset>',
+                     '<PlatformToolset>v143</PlatformToolset>'
+
+          if ($updated -ne $content) {
+            Write-Host "Updating VC toolset: $path"
+            Set-Content -Path $path -Value $updated -Encoding UTF8
+          }
+        }
+
+    # ================================================================
+    # FIX LEGACY UWP C# PROJECT
+    #
+    # App.xaml.cs uses:
+    #   Windows.ApplicationModel
+    #   Windows.UI.Xaml
+    #   Windows.Foundation.Collections
+    #
+    # These require the UWP framework/package reference.
+    #
+    # Do NOT touch source .cs files.
+    # ================================================================
+    - name: Ensure MobSDes UWP framework reference
+      shell: powershell
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        $project = Join-Path $env:GITHUB_WORKSPACE "src\MobSDes\MobSDes.csproj"
+
+        if (-not (Test-Path $project)) {
+          throw "MobSDes.csproj not found: $project"
+        }
+
+        [xml]$xml = Get-Content $project -Raw
+
+        $ns = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
+
+        if ($xml.Project.NamespaceURI) {
+          $ns.AddNamespace("msb", $xml.Project.NamespaceURI)
+          $projectNode = $xml.Project
+        } else {
+          $projectNode = $xml.Project
+        }
+
+        $packageExists = $false
+
+        foreach ($itemGroup in $projectNode.ItemGroup) {
+          foreach ($package in $itemGroup.PackageReference) {
+            if ($package.Include -eq "Microsoft.NETCore.UniversalWindowsPlatform") {
+              $packageExists = $true
+            }
+          }
+        }
+
+        if (-not $packageExists) {
+          Write-Host "Adding Microsoft.NETCore.UniversalWindowsPlatform..."
+
+          $itemGroup = $xml.CreateElement("ItemGroup")
+          $package = $xml.CreateElement("PackageReference")
+
+          $package.SetAttribute(
+            "Include",
+            "Microsoft.NETCore.UniversalWindowsPlatform"
+          )
+
+          $package.SetAttribute("Version", "6.2.14")
+
+          [void]$itemGroup.AppendChild($package)
+          [void]$projectNode.AppendChild($itemGroup)
+
+          $xml.Save($project)
+
+          Write-Host "UWP framework PackageReference added."
+        } else {
+          Write-Host "Microsoft.NETCore.UniversalWindowsPlatform already exists."
+        }
+
+        Write-Host ""
+        Write-Host "MobSDes.csproj:"
+        Get-Content $project
+
+    # ================================================================
+    # SETUP NUGET
+    # ================================================================
+    - name: Setup NuGet
+      uses: NuGet/setup-nuget@v1.2.0
+
+    # ================================================================
+    # RESTORE AFTER ALL PROJECT MODIFICATIONS
+    # ================================================================
+    - name: Restore NuGet packages
+      shell: powershell
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        nuget restore src/MobileShellPlus.sln -NonInteractive
+
+        if ($LASTEXITCODE -ne 0) {
+          throw "NuGet restore failed."
+        }
+
+    # ================================================================
+    # VERIFY IMPORTANT PROJECT SETTINGS BEFORE BUILD
+    # ================================================================
+    - name: Inspect project SDK configuration
+      shell: powershell
+      run: |
+        Write-Host "=== MobSDes.csproj ==="
+        Get-Content src/MobSDes/MobSDes.csproj
+
+        Write-Host ""
+        Write-Host "=== WAP project SDK references ==="
+
+        Get-ChildItem -Recurse -Filter *.wapproj |
+          ForEach-Object {
+            Write-Host ""
+            Write-Host "FILE: $($_.FullName)"
+            Select-String `
+              -Path $_.FullName `
+              -Pattern "TargetPlatformVersion|WindowsTargetPlatformVersion|18362|26100"
+          }
+
+    # ================================================================
+    # BUILD
+    # ================================================================
+    - name: Build Solution (ARM64)
+      shell: powershell
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        msbuild src/MobileShellPlus.sln `
+          /m `
+          /p:Configuration=Release `
+          /p:Platform=ARM64 `
+          /p:WindowsTargetPlatformVersion=10.0.26100.0 `
+          /p:TargetPlatformVersion=10.0.26100.0 `
+          /p:AppxBundle=Never `
+          /p:SignManifests=false `
+          /p:AppxPackageSigningEnabled=false `
+          /p:UapSkipSigning=true `
+          /p:GenerateAppxPackageOnBuild=false `
+          /verbosity:minimal
+
+        if ($LASTEXITCODE -ne 0) {
+          throw "MSBuild failed with exit code $LASTEXITCODE"
+        }
+
+    # ================================================================
+    # ARTIFACTS
+    # ================================================================
+    - name: Create Artifact Directory
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force artifacts | Out-Null
+
+    - name: List Build Output Directories
+      shell: pwsh
+      run: |
+        Write-Host "Listing build output directories:"
+
+        if (Test-Path "src\MobSDes\bin") {
+          Get-ChildItem `
+            -Path "src\MobSDes\bin" `
+            -Recurse `
+            -Directory |
+            Select-Object FullName
+        } else {
+          Write-Host "src\MobSDes\bin directory not found"
+        }
+
+    - name: Package MobSDes ARM64
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        $destination = "artifacts\Windows11MobileShell-arm64"
+
+        New-Item -ItemType Directory -Force $destination | Out-Null
+
+        $candidates = @(
+          "src\MobSDes\bin\ARM64\Release",
+          "src\MobSDes\bin\arm64\Release",
+          "src\MobSDes\bin\Release\ARM64",
+          "src\MobSDes\bin\Release\arm64"
+        )
+
+        $source = $null
+
+        foreach ($candidate in $candidates) {
+          if (Test-Path $candidate) {
+            $source = $candidate
+            break
+          }
+        }
+
+        if (-not $source) {
+          throw "MobSDes ARM64 Release output not found."
+        }
+
+        Write-Host "Packaging: $source"
+
+        Copy-Item `
+          -Path "$source\*" `
+          -Destination $destination `
+          -Recurse `
+          -Force
+
+        Compress-Archive `
+          -Path "$destination\*" `
+          -DestinationPath "artifacts\Windows11MobileShell-arm64.zip" `
+          -Force
+
+    # ================================================================
+    # APPX
+    # ================================================================
+    - name: Create Appx/MSIX Package
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        $source = "artifacts\Windows11MobileShell-arm64"
+        $output = "artifacts\Windows11MobileShell-arm64.appx"
+
+        $makeAppx = `
+          "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\MakeAppx.exe"
+
+        if (-not (Test-Path $makeAppx)) {
+          throw "MakeAppx.exe not found: $makeAppx"
+        }
+
+        & $makeAppx pack /d $source /p $output /o
+
+        if ($LASTEXITCODE -ne 0) {
+          throw "MakeAppx failed with exit code $LASTEXITCODE"
+        }
+
+        Write-Host "Appx package created: $output"
+
+    # ================================================================
+    # CERTIFICATE
+    # ================================================================
+    - name: Create Self-Signed Certificate
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        $cert = New-SelfSignedCertificate `
+          -Type CodeSigningCert `
+          -Subject "CN=ADelt" `
+          -CertStoreLocation "Cert:\CurrentUser\My"
+
+        $pfxPath = "artifacts\ADelt.pfx"
+
+        $password = ConvertTo-SecureString `
+          -String "password123" `
+          -Force `
+          -AsPlainText
+
+        Export-PfxCertificate `
+          -Cert $cert `
+          -FilePath $pfxPath `
+          -Password $password
+
+        Write-Host "Self-signed PFX created: $pfxPath"
+
+    # ================================================================
+    # SIGN
+    # ================================================================
+    - name: Sign Appx
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        $appx = "artifacts\Windows11MobileShell-arm64.appx"
+        $pfx = "artifacts\ADelt.pfx"
+        $password = "password123"
+
+        $signtool = `
+          "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe"
+
+        if (-not (Test-Path $signtool)) {
+          throw "signtool.exe not found: $signtool"
+        }
+
+        & $signtool sign `
+          /fd SHA256 `
+          /f $pfx `
+          /p $password `
+          /tr http://timestamp.digicert.com `
+          /td SHA256 `
+          $appx
+
+        if ($LASTEXITCODE -ne 0) {
+          throw "signtool failed with exit code $LASTEXITCODE"
+        }
+
+        Write-Host "Appx signed successfully."
+
+    # ================================================================
+    # UPLOAD
+    # ================================================================
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: Windows11MobileShell
+        path: artifacts/*
+
+    # ================================================================
+    # RELEASE
+    # ================================================================
+    - name: Create Release
+      id: create_release
+      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/xamlhost')
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v${{ github.run_number }}
+        name: Windows 11 Mobile Shell v${{ github.run_number }}
+        draft: false
+        prerelease: false
+        files: |
+          artifacts/Windows11MobileShell-arm64.*
