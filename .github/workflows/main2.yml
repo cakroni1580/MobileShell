@@ -1,13 +1,4 @@
-# BEFORE
-# Restore NuGet packages
-# ...
-# Find old toolsets
-# ...
-# Retarget legacy VC projects
-# ...
-# Build Solution
 
-# AFTER
 name: Build Windows 11 Mobile Shell
 
 on:
@@ -30,14 +21,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    # ================================================================
-    # INSTALL VS COMPONENTS
-    #
-    # MobSDes is legacy UWP/XAML C#.
-    # Therefore Windows SDK alone is NOT enough:
-    # UWP.Support is required for UAP.props / UAP.targets and
-    # the UWP project infrastructure.
-    # ================================================================
+    
     - name: Install Windows 11 SDK + UWP tools
       shell: powershell
       run: |
@@ -76,15 +60,11 @@ jobs:
           throw "Visual Studio Installer failed with exit code $LASTEXITCODE"
         }
 
-    # ================================================================
-    # SETUP MSBUILD
-    # ================================================================
+    
     - name: Setup MSBuild VS2022
       uses: microsoft/setup-msbuild@v2
 
-    # ================================================================
-    # VERIFY WINDOWS SDK + UWP INFRASTRUCTURE
-    # ================================================================
+    
     - name: Verify Windows SDK and UWP
       shell: powershell
       run: |
@@ -93,11 +73,14 @@ jobs:
         $sdkRoot = "C:\Program Files (x86)\Windows Kits\10"
         $sdkPath = Join-Path $sdkRoot "Platforms\UAP\$env:WINDOWS_SDK_VERSION"
 
-        Write-Host "Checking UAP SDK:"
-        Write-Host $sdkPath
+        Write-Host "================================================"
+        Write-Host "Windows SDK diagnostic"
+        Write-Host "================================================"
+        Write-Host "SDK root : $sdkRoot"
+        Write-Host "UAP path : $sdkPath"
+        Write-Host ""
 
         if (-not (Test-Path $sdkPath)) {
-          Write-Host ""
           Write-Host "Available UAP SDK versions:"
           Get-ChildItem "$sdkRoot\Platforms\UAP" -Directory |
             Select-Object -ExpandProperty Name
@@ -105,32 +88,51 @@ jobs:
           throw "UAP SDK $env:WINDOWS_SDK_VERSION was not installed."
         }
 
-        $uapProps = Join-Path $sdkPath "Platform.props"
+        Write-Host "UAP SDK directory exists."
+        Write-Host ""
 
-        if (-not (Test-Path $uapProps)) {
-          throw "UAP Platform.props missing: $uapProps"
-        }
-
-        Write-Host "UAP SDK OK:"
-        Get-ChildItem $sdkPath
+        Write-Host "Top-level UAP files:"
+        Get-ChildItem $sdkPath -Force |
+          Select-Object Name, FullName
 
         Write-Host ""
-        Write-Host "Installed Windows SDKs:"
+        Write-Host "Searching UAP.props inside SDK:"
+        $uapProps = Get-ChildItem `
+          $sdkPath `
+          -Recurse `
+          -Filter UAP.props `
+          -ErrorAction SilentlyContinue
+
+        if (-not $uapProps) {
+          Write-Host "UAP.props was NOT found inside:"
+          Write-Host $sdkPath
+    
+          Write-Host ""
+          Write-Host "Searching entire Windows Kits tree:"
+          Get-ChildItem `
+            $sdkRoot `
+            -Recurse `
+            -Filter UAP.props `
+            -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty FullName
+
+          throw "UAP.props not found."
+        }
+
+        Write-Host "UAP.props found:"
+        $uapProps |
+          Select-Object -ExpandProperty FullName
+
+        Write-Host ""
+        Write-Host "Installed UAP SDK versions:"
         Get-ChildItem "$sdkRoot\Platforms\UAP" -Directory |
           Select-Object -ExpandProperty Name
 
         Write-Host ""
+        Write-Host "MSBuild:"
         msbuild -version
 
-    # ================================================================
-    # RETARGET LEGACY WINDOWS SDK REFERENCES
-    #
-    # IMPORTANT:
-    # Only TargetPlatformVersion / WindowsTargetPlatformVersion /
-    # SDK-style SDK references are changed.
-    #
-    # TargetPlatformMinVersion is deliberately NOT changed.
-    # ================================================================
+    
     - name: Retarget Windows SDK to 26100
       shell: powershell
       run: |
@@ -179,9 +181,7 @@ jobs:
           Write-Host "No project SDK references to 10.0.18362.0 remain."
         }
 
-    # ================================================================
-    # RETARGET OLD VC TOOLSETS
-    # ================================================================
+    
     - name: Retarget legacy VC projects to v143
       shell: powershell
       run: |
@@ -205,18 +205,7 @@ jobs:
           }
         }
 
-    # ================================================================
-    # FIX LEGACY UWP C# PROJECT
-    #
-    # App.xaml.cs uses:
-    #   Windows.ApplicationModel
-    #   Windows.UI.Xaml
-    #   Windows.Foundation.Collections
-    #
-    # These require the UWP framework/package reference.
-    #
-    # Do NOT touch source .cs files.
-    # ================================================================
+
     - name: Ensure MobSDes UWP framework reference
       shell: powershell
       run: |
@@ -276,15 +265,11 @@ jobs:
         Write-Host "MobSDes.csproj:"
         Get-Content $project
 
-    # ================================================================
-    # SETUP NUGET
-    # ================================================================
+    
     - name: Setup NuGet
       uses: NuGet/setup-nuget@v1.2.0
 
-    # ================================================================
-    # RESTORE AFTER ALL PROJECT MODIFICATIONS
-    # ================================================================
+    
     - name: Restore NuGet packages
       shell: powershell
       run: |
@@ -296,9 +281,7 @@ jobs:
           throw "NuGet restore failed."
         }
 
-    # ================================================================
-    # VERIFY IMPORTANT PROJECT SETTINGS BEFORE BUILD
-    # ================================================================
+    
     - name: Inspect project SDK configuration
       shell: powershell
       run: |
@@ -317,9 +300,7 @@ jobs:
               -Pattern "TargetPlatformVersion|WindowsTargetPlatformVersion|18362|26100"
           }
 
-    # ================================================================
-    # BUILD
-    # ================================================================
+    
     - name: Build Solution (ARM64)
       shell: powershell
       run: |
@@ -342,9 +323,7 @@ jobs:
           throw "MSBuild failed with exit code $LASTEXITCODE"
         }
 
-    # ================================================================
-    # ARTIFACTS
-    # ================================================================
+    
     - name: Create Artifact Directory
       shell: pwsh
       run: |
@@ -407,9 +386,7 @@ jobs:
           -DestinationPath "artifacts\Windows11MobileShell-arm64.zip" `
           -Force
 
-    # ================================================================
-    # APPX
-    # ================================================================
+    
     - name: Create Appx/MSIX Package
       shell: pwsh
       run: |
@@ -433,9 +410,7 @@ jobs:
 
         Write-Host "Appx package created: $output"
 
-    # ================================================================
-    # CERTIFICATE
-    # ================================================================
+    
     - name: Create Self-Signed Certificate
       shell: pwsh
       run: |
@@ -460,9 +435,7 @@ jobs:
 
         Write-Host "Self-signed PFX created: $pfxPath"
 
-    # ================================================================
-    # SIGN
-    # ================================================================
+    
     - name: Sign Appx
       shell: pwsh
       run: |
@@ -493,18 +466,14 @@ jobs:
 
         Write-Host "Appx signed successfully."
 
-    # ================================================================
-    # UPLOAD
-    # ================================================================
+    
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
         name: Windows11MobileShell
         path: artifacts/*
 
-    # ================================================================
-    # RELEASE
-    # ================================================================
+    
     - name: Create Release
       id: create_release
       if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/xamlhost')
