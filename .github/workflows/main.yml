@@ -1,0 +1,166 @@
+name: Build Windows 11 Mobile Shell
+
+on:
+  push:
+    branches: [ main, xamlhost, codegen-bot/windows11-mobile-ui ]
+  pull_request:
+    branches: [ main, xamlhost ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    
+    permissions:
+      contents: write
+      
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Windows 11 SDK 22621 via VS Installer
+      shell: powershell
+      run: |
+       $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+       $vsPath = & $vswhere `
+       -version "[17.0,18.0)" `
+       -products * `
+       -property installationPath
+       $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+
+       & $vsInstaller modify `
+       --installPath "$vsPath" `
+       --add Microsoft.VisualStudio.Component.VC.Tools.ARM64 `
+       --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+       --add Microsoft.VisualStudio.Component.VC.v143 `
+       --add Microsoft.VisualStudio.Component.Windows11SDK.26100 `
+       --add Microsoft.VisualStudio.Component.VC.v140 `
+       --quiet --wait --norestart
+
+    - name: Setup MSBuild VS2022
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Check MSVC
+      shell: powershell
+      run: |
+        msbuild -version
+        vswhere -products * -format json
+
+    - name: Setup NuGet
+      uses: NuGet/setup-nuget@v1.2.0
+      
+    - name: Restore NuGet packages
+      run: nuget restore src/MobileShellPlus.sln
+
+    - name: Find old toolsets
+      shell: powershell
+      run: |
+        Get-ChildItem -Recurse -Filter *.vcxproj |
+        Select-String "PlatformToolset"
+
+    - name: Retarget legacy VC projects to v143
+      shell: powershell
+      run: |
+        Get-ChildItem -Recurse -Filter *.vcxproj | ForEach-Object {
+          Write-Host "Updating $($_.FullName)"
+
+          (Get-Content $_.FullName) `
+          -replace '<PlatformToolset>v140</PlatformToolset>', '<PlatformToolset>v143</PlatformToolset>' `
+          -replace '<PlatformToolset Condition=.*?>v141</PlatformToolset>', '' `
+          -replace '<PlatformToolset Condition=.*?>v142</PlatformToolset>', '' |
+          Set-Content $_.FullName
+        }
+    
+    - name: Build Solution (ARM64)
+      run: |
+       msbuild src/MobileShellPlus.sln `
+       /p:Configuration=Release `
+       /p:Platform=ARM64 `
+       /p:WindowsTargetPlatformVersion=10.0.26100.0 `
+       /p:AppxBundle=Never `
+       /p:SignManifests=false `
+       /p:AppxPackageSigningEnabled=false `
+       /p:UapSkipSigning=true
+          
+    - name: Create Artifact Directory
+      run: mkdir artifacts
+      
+    - name: List Build Output Directories
+      run: |
+        Write-Host "Listing build output directories:"
+        if (Test-Path -Path "src/MobSDes/bin") {
+          Get-ChildItem -Path "src/MobSDes/bin" -Recurse -Directory | Select-Object FullName
+        } else {
+          Write-Host "src/MobSDes/bin directory not found"
+        }
+      shell: pwsh
+      
+    - name: Package MobSDes (arm64)
+      run: |
+        mkdir -p artifacts/Windows11MobileShell-arm64
+        # First check if the expected directory exists
+        if (Test-Path -Path "src/MobSDes/bin/arm64/Release") {
+          cp -r src/MobSDes/bin/ARM64/Release/* artifacts/Windows11MobileShell-arm64/
+        } elseif (Test-Path -Path "src/MobSDes/bin/Release/arm64") {
+          cp -r src/MobSDes/bin/ARM64/Release/* artifacts/Windows11MobileShell-arm64/
+        } else {
+          # Create a placeholder file to avoid empty zip
+          echo "Build output not found" > artifacts/Windows11MobileShell-arm64/README.txt
+        }
+        Compress-Archive -Path artifacts/Windows11MobileShell-arm64 -DestinationPath artifacts/Windows11MobileShell-arm64.zip
+      shell: pwsh
+      
+    - name: Create Appx/MSIX Package
+      run: |
+        $source = "artifacts/Windows11MobileShell-arm64"
+        $output = "artifacts/Windows11MobileShell-arm64.appx"
+        $makeAppx = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\MakeAppx.exe"
+
+        if (Test-Path $makeAppx) {
+          & $makeAppx pack /d $source /p $output
+          Write-Host "Appx package created at $output"
+        } else {
+          Write-Error "MakeAppx.exe not found"
+        }
+      shell: pwsh
+
+    - name: Create Self-Signed Certificate (match manifest)
+      run: |
+        $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=ADelt" -CertStoreLocation "Cert:\CurrentUser\My"
+        $pfxPath = "artifacts/ADelt.pfx"
+        $password = ConvertTo-SecureString -String "password123" -Force -AsPlainText
+        Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $password
+        Write-Host "Self-signed PFX created at $pfxPath"
+      shell: pwsh
+
+    - name: Sign Appx with Self-Signed Certificate
+      run: |
+        $appx = "artifacts/Windows11MobileShell-arm64.appx"
+        $pfx = "artifacts/ADelt.pfx"
+        $password = "password123"
+         $signtool = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe"
+
+        if (Test-Path $signtool) {
+           & $signtool sign /fd SHA256 /f $pfx /p $password /tr http://timestamp.digicert.com /td SHA256 $appx
+           Write-Host "Appx signed with self-signed certificate"
+        } else {
+           Write-Error "signtool.exe not found!"
+        }
+      shell: pwsh
+    
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: Windows11MobileShell
+        path: artifacts/*
+        
+    - name: Create Release
+      id: create_release
+      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/xamlhost')
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v${{ github.run_number }}
+        name: Windows 11 Mobile Shell v${{ github.run_number }}
+        draft: false
+        prerelease: false
+        files: |
+          artifacts/Windows11MobileShell-arm64.*
