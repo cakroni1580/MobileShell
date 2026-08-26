@@ -1,5 +1,7 @@
 ﻿#pragma once
 #include <unknwn.h>
+#include <iterator>
+
 
 #include <winrt/Windows.ApplicationModel.Core.h>
 #include <winrt/Windows.UI.Xaml.Input.h>
